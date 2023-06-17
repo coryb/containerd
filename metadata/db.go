@@ -144,7 +144,7 @@ func (m *DB) Init(ctx context.Context) error {
 	// errSkip is used when no migration or version needs to be written
 	// to the database and the transaction can be immediately rolled
 	// back rather than performing a much slower and unnecessary commit.
-	var errSkip = errors.New("skip update")
+	errSkip := errors.New("skip update")
 
 	err := m.db.Update(func(tx *bolt.Tx) error {
 		var (
@@ -352,16 +352,22 @@ func (s GCStats) Elapsed() time.Duration {
 
 // GarbageCollect removes resources (snapshots, contents, ...) that are no longer used.
 func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
+	log := log.G(ctx)
+	log.Debug("garbage-collect: wait wlock")
 	m.wlock.Lock()
+	log.Debug("garbage-collect: acquired wlock")
 	t1 := time.Now()
 	c := startGCContext(ctx, m.collectors)
-
+	log.Debug("garbage-collect: start gc context")
 	marked, err := m.getMarked(ctx, c) // Pass in gc context
 	if err != nil {
+		log.Debug("garbage-collect: get marked failed")
 		m.wlock.Unlock()
+		log.Debug("garbage-collect: released wlock")
 		c.cancel(ctx)
 		return nil, err
 	}
+	log.Debug("garbage-collect: get marked done")
 
 	events := []namespacedEvent{}
 	if err := m.db.Update(func(tx *bolt.Tx) error {
@@ -399,10 +405,13 @@ func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
 
 		return nil
 	}); err != nil {
+		log.Debug("garbage-collect: scan all failed")
 		m.wlock.Unlock()
+		log.Debug("garbage-collect: released wlock")
 		c.cancel(ctx)
 		return nil, err
 	}
+	log.WithField("duration", time.Since(t1).Truncate(time.Millisecond).String()).Debug("garbage-collect: scan all done")
 
 	var stats GCStats
 	var wg sync.WaitGroup
@@ -411,6 +420,7 @@ func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
 	wg.Add(1)
 	go func() {
 		m.publishEvents(events)
+		log.Debug("garbage-collect: publish events done")
 		wg.Done()
 	}()
 
@@ -421,8 +431,8 @@ func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
 		var sl sync.Mutex
 		stats.SnapshotD = map[string]time.Duration{}
 		wg.Add(len(m.dirtySS))
+		log.Debugf("garbage-collect: adding snapshotter cleanup [snapshots: %d]", len(m.dirtySS))
 		for snapshotterName := range m.dirtySS {
-			log.G(ctx).WithField("snapshotter", snapshotterName).Debug("schedule snapshotter cleanup")
 			go func(snapshotterName string) {
 				st1 := time.Now()
 				m.cleanupSnapshotter(ctx, snapshotterName)
@@ -439,11 +449,12 @@ func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
 
 	if m.dirtyCS {
 		wg.Add(1)
-		log.G(ctx).Debug("schedule content cleanup")
+		log.Debug("garbage-collect: schedule content cleanup")
 		go func() {
 			ct1 := time.Now()
 			m.cleanupContent(ctx)
 			stats.ContentD = time.Since(ct1)
+			log.Debug("garbage-collect: content cleanup done")
 			wg.Done()
 		}()
 		m.dirtyCS = false
@@ -451,10 +462,13 @@ func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
 
 	stats.MetaD = time.Since(t1)
 	m.wlock.Unlock()
+	log.Debug("garbage-collect: released wlock")
 
 	c.finish(ctx)
+	log.Debug("garbage-collect: gc context finished")
 
 	wg.Wait()
+	log.Debug("garbage-collect: snapshot cleanup done")
 
 	return stats, err
 }
